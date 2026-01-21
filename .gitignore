@@ -1,0 +1,9 @@
+# Nix
+result*
+
+# Misc
+.direnv
+
+*.wav
+!wav-files/*.wav
+

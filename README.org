@@ -1,0 +1,12 @@
+* CABATA
+
+An implementation of a nix-ready TABATA timer for motivation, implemented in vibe-coded C!
+
+** Running
+
+Currently, =nix run= works.
+
+** Utilities
+
+Running the command =nix run .#genWavFiles= will generate the wav files into the folder =wav-files=.
+
