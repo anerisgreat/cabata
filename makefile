@@ -51,25 +51,22 @@ CFLAGS += -Wall -Wextra -O2 -I$(WAVDIR) -std=c23 \
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # -------------------------------------------------
-SRC  := main.c audio.c $(WAV_TABLE_C) $(WAV_C_FILES)
+SRC  := tabata.c audio.c $(WAV_TABLE_C) $(WAV_C_FILES)
 OBJ  := $(SRC:.c=.o)
 
 # Every object that can refer to the generated header must wait for it
 $(OBJ): $(WAV_TABLE_H)
 
-myprog: $(OBJ)
+cabata: $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $(OBJ) -lsndfile -lportaudio -lasound
 
 -include $(OBJ:.o=.d)
 
 .PHONY: clean install
 clean:
-	rm -f $(OBJ) myprog $(WAV_C_FILES) $(WAV_TABLE_H) $(WAV_TABLE_C)
+	rm -f $(OBJ) cabata $(WAV_C_FILES) $(WAV_TABLE_H) $(WAV_TABLE_C)
 
-install: myprog $(WAV_TABLE_H)
+install: cabata $(WAV_TABLE_H)
 	@echo "Installing binary to $(BINDIR)..."
 	@install -d $(BINDIR)
-	@install -m 755 myprog $(BINDIR)/
-	@echo "Installing header to $(INCLUDEDIR)..."
-	@install -d $(INCLUDEDIR)
-	@install -m 644 $(WAV_TABLE_H) $(INCLUDEDIR)/
+	@install -m 755 cabata $(BINDIR)/

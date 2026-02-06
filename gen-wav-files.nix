@@ -4,20 +4,29 @@ let
     (python-pkgs: with python-pkgs;
       [ gtts ] ));
 
-  firstNum = 1;
+  firstNum = 0;
   lastNum = 60;
   nums = pkgs.lib.range firstNum lastNum;
   numAttrs = builtins.listToAttrs
     (map (n: { name = "num${toString n}"; value = toString n; }) nums);
   prompts = {
+    round = "round";
+    of = "of";
     youhave = "You have";
+    towork = "to work";
+    workfor = "work for";
+    torest = "to rest";
+    restfor = "rest for";
+    hoursleft = "hours left";
     minutesleft = "minutes left";
     secondsleft = "seconds left";
-    hoursleft = "hours left";
+    hours = "hours";
     minutes = "minutes";
     seconds = "seconds";
-    hours = "hours";
     done = "done!";
+    paused = "Timer paused!";
+    resumed = "Timer resumed!";
+    started = "Timer started!";
     skrakaka = "skrakaka!";
     message001 = "Congrats, you survived another morning—now try not to waste the rest of the day.";
     message002 = "If you’re feeling lazy, just remember: at least you’re not as lazy as your future self.";
@@ -31,7 +40,7 @@ let
     message010 = "You’re one coffee away from pretending you’ve got this under control.";
     message011 = "If you think today’s a disaster, imagine how spectacular tomorrow could be—if you survive.";
     message012 = "Your potential is like a black hole: massive, dark, and probably swallowing everything.";
-    message013 = "At least you’re not stuck in a perpetual loop of success—mediocrity is more realistic.";
+    message013 = "At least you’re not stuck in a perpetual loop of success—mediocrity iplay_soundplay_sounds more realistic.";
     message014 = "The only thing you’re guaranteed to improve is your ability to make excuses.";
     message015 = "Good thing you’re not perfect; otherwise, you’d have to actually try.";
     message016 = "Remember: the road to success is paved with a lot of missed turns and sighs.";

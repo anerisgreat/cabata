@@ -1,41 +1,61 @@
+/*=====================================================================
+ *  audio.c  –  implementation of the public API declared in audio.h
+ *====================================================================*/
 #define _POSIX_C_SOURCE 200809L   /* for strdup() */
 #include "audio.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <alsa/asoundlib.h>
 #include <sndfile.h>
 #include "wav_table.h"
 
-static snd_pcm_t *pcm_handle = NULL;   /* shared ALSA PCM handle */
-extern EmbeddedWav get_embedded_wav(const char* name); //We get definition later
+/* -----------------------------------------------------------------
+ *  Global objects
+ * ----------------------------------------------------------------- */
+static snd_pcm_t *pcm_handle = NULL;        /* shared ALSA PCM handle */
+extern EmbeddedWav get_embedded_wav(const char *name);
 
-/* -------------------------------------------------------------
- *  Helper: virtual‑file object that points to a memory buffer
- * ------------------------------------------------------------- */
+/* -----------------------------------------------------------------
+ *  Helper – virtual‑file object that points to a memory buffer
+ * ----------------------------------------------------------------- */
 typedef struct {
-    const unsigned char *data;   /* pointer to the whole wav file */
-    sf_count_t          size;    /* total number of bytes  */
-    sf_count_t          pos;     /* current read position   */
+    const unsigned char *data;   /* pointer to the whole wav file   */
+    sf_count_t          size;    /* total number of bytes           */
+    sf_count_t          pos;     /* current read position (bytes)   */
 } MemFile;
 
-/* read callback */
+/* -----------------------------------------------------------------
+ *  Global state for the “play‑queue”
+ * ----------------------------------------------------------------- */
+typedef struct {
+    short *buf;               /* interleaved S16‑LE samples            */
+    size_t  frames;           /* number of frames currently stored      */
+    size_t  capacity_frames; /* allocated capacity (in frames)         */
+    unsigned int rate;        /* sample rate of the current queue      */
+    unsigned int channels;    /* channel count of the current queue    */
+} AudioChain;
+
+/* One instance – keep it static so the API does not require a handle */
+static AudioChain g_chain = { NULL, 0, 0, 0, 0 };
+
+/*=====================================================================
+ *  Virtual‑IO callbacks (unchanged)
+ *====================================================================*/
 static sf_count_t mem_read(void *ptr, sf_count_t count, void *user_data)
 {
-    MemFile *mf = (MemFile *)user_data;
+    MemFile *mf = user_data;
     sf_count_t left = mf->size - mf->pos;
     if (count > left) count = left;
     memcpy(ptr, mf->data + mf->pos, (size_t)count);
     mf->pos += count;
     return count;
 }
-
-/* seek callback */
 static sf_count_t mem_seek(sf_count_t offset, int whence, void *user_data)
 {
-    MemFile *mf = (MemFile *)user_data;
+    MemFile *mf = user_data;
     sf_count_t newpos;
-
     switch (whence) {
         case SEEK_SET: newpos = offset;                     break;
         case SEEK_CUR: newpos = mf->pos + offset;           break;
@@ -46,22 +66,18 @@ static sf_count_t mem_seek(sf_count_t offset, int whence, void *user_data)
     mf->pos = newpos;
     return newpos;
 }
-
-/* tell callback */
 static sf_count_t mem_tell(void *user_data)
 {
     return ((MemFile *)user_data)->pos;
 }
-
-/* get length callback (optional, but nice to have) */
 static sf_count_t mem_length(void *user_data)
 {
     return ((MemFile *)user_data)->size;
 }
 
-/* -------------------------------------------------------------
- *  Open a WAV that lives in memory
- * ------------------------------------------------------------- */
+/*=====================================================================
+ *  Open a WAV that lives in memory (unchanged)
+ *====================================================================*/
 static SNDFILE *sf_open_mem(const unsigned char *buf,
                             sf_count_t          buflen,
                             SF_INFO            *sfinfo)
@@ -70,7 +86,7 @@ static SNDFILE *sf_open_mem(const unsigned char *buf,
         .get_filelen = mem_length,
         .seek        = mem_seek,
         .read        = mem_read,
-        .write       = NULL,          /* we never write */
+        .write       = NULL,
         .tell        = mem_tell
     };
 
@@ -82,15 +98,16 @@ static SNDFILE *sf_open_mem(const unsigned char *buf,
 
     SNDFILE *snd = sf_open_virtual(&vio, SFM_READ, sfinfo, mf);
     if (!snd) {
-        free(mf);                     /* sf_open_virtual failed */
+        free(mf);
         return NULL;
     }
-    /* libsndfile will free the MemFile object when sf_close() is called,
-       because we stored the pointer in the "user_data" field. */
+    /* libsndfile will free the MemFile object when sf_close() is called */
     return snd;
 }
 
-/* --------------------------------------------------------------- */
+/*=====================================================================
+ *  ALSA HW‑parameter helper (unchanged)
+ *====================================================================*/
 static bool set_hw_params(snd_pcm_t *pcm,
                           unsigned int rate,
                           unsigned int channels,
@@ -109,15 +126,15 @@ static bool set_hw_params(snd_pcm_t *pcm,
     snd_pcm_hw_params_set_channels(pcm, hw, channels);
     snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, NULL);
 
-    /* Ask for a period of ~10 ms (≈rate/100) and let ALSA round it */
+    /* ask for a period of ~10 ms */
     snd_pcm_uframes_t period = rate / 100;
     snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, NULL);
-    *period_sz = period;                     /* remember the real period */
+    *period_sz = period;
 
-    /* Buffer = N * period (typical 2–4 periods) */
+    /* buffer = 4 periods (typical) */
     snd_pcm_uframes_t buffer = period * 4;
     snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
-    *buffer_sz = buffer;                     /* keep it for debugging */
+    *buffer_sz = buffer;
 
     err = snd_pcm_hw_params(pcm, hw);
     snd_pcm_hw_params_free(hw);
@@ -129,38 +146,91 @@ static bool set_hw_params(snd_pcm_t *pcm,
     return true;
 }
 
-
-/* --------------------------------------------------------------- */
+/*=====================================================================
+ *  PUBLIC API – initialisation / clean‑up
+ *====================================================================*/
 bool audio_init(void)
 {
-    int err;
-    const char *device = "default";          /* or "plug:dmix" etc. */
+    if (pcm_handle)               /* already opened */
+        return true;
 
-    err = snd_pcm_open(&pcm_handle, device,
-                       SND_PCM_STREAM_PLAYBACK, 0);
-    if (err < 0) {
-        fprintf(stderr, "ALSA: cannot open PCM device %s: %s\n",
-                device, snd_strerror(err));
+    int rc = snd_pcm_open(&pcm_handle, "default",
+                          SND_PCM_STREAM_PLAYBACK, 0);
+    if (rc < 0) {
+        fprintf(stderr, "ALSA open error: %s\n", snd_strerror(rc));
+        pcm_handle = NULL;
         return false;
     }
-    /* No HW parameters are set yet – they will be configured
-       on the first call to audio_play_wav() (may differ per file). */
     return true;
 }
 
-/* --------------------------------------------------------------- */
-bool audio_play_wav_mem(const unsigned char *wav_buf,
-                        sf_count_t wav_len)
+/* audio_cleanup() is already present at the bottom of the file */
+
+/*=====================================================================
+ *  PLAY‑QUEUE – internal helpers
+ *====================================================================*/
+/* Grow the internal buffer so it can hold at least ‘need’ frames. */
+static bool chain_ensure_capacity(size_t need)
+{
+    if (need <= g_chain.capacity_frames)
+        return true;
+
+    size_t new_cap = g_chain.capacity_frames ? g_chain.capacity_frames : 64;
+    while (new_cap < need)
+        new_cap *= 2;                     /* exponential growth */
+
+    short *new_buf = realloc(g_chain.buf,
+                             new_cap * g_chain.channels * sizeof *new_buf);
+    if (!new_buf) {
+        perror("realloc");
+        return false;
+    }
+    g_chain.buf = new_buf;
+    g_chain.capacity_frames = new_cap;
+    return true;
+}
+
+/*=====================================================================
+ *  PUBLIC API – play‑queue management
+ *====================================================================*/
+bool audio_chain_init(void)
+{
+    /* Reset the queue – keep any already‑allocated buffer so that a
+       subsequent add can reuse it without another malloc. */
+    g_chain.frames   = 0;
+    g_chain.rate     = 0;
+    g_chain.channels = 0;
+    return true;
+}
+
+void audio_chain_cleanup(void)
+{
+    if (g_chain.buf) {
+        free(g_chain.buf);
+        g_chain.buf = NULL;
+    }
+    g_chain.capacity_frames = 0;
+    g_chain.frames   = 0;
+    g_chain.rate     = 0;
+    g_chain.channels = 0;
+
+    audio_cleanup();            /* close ALSA if it was opened */
+}
+
+/* Add a raw wav buffer (memory + length) to the chain. */
+bool audio_chain_add(const unsigned char *wav_buf,
+                     sf_count_t wav_len)
 {
     SF_INFO sfinfo = {0};
+
+    /* open the wav from memory */
     SNDFILE *sf = sf_open_mem(wav_buf, wav_len, &sfinfo);
     if (!sf) {
-        fprintf(stderr, "libsndfile: %s\n",
-                sf_strerror(NULL));
+        fprintf(stderr, "libsndfile: %s\n", sf_strerror(NULL));
         return false;
     }
 
-    /* ---------- format sanity check ---------- */
+    /* sanity check – we only support 16‑bit PCM WAV */
     if ((sfinfo.format & SF_FORMAT_TYPEMASK) != SF_FORMAT_WAV ||
         (sfinfo.format & SF_FORMAT_SUBMASK) != SF_FORMAT_PCM_16) {
         fprintf(stderr,
@@ -170,45 +240,142 @@ bool audio_play_wav_mem(const unsigned char *wav_buf,
         return false;
     }
 
-    /* ---------- HW re‑configuration if needed ---------- */
+    /* -------------------------------------------------------------
+     *  Verify that the new segment matches the already‑queued format,
+     *  or initialise the queue if this is the first segment.
+     * ------------------------------------------------------------- */
+    if (g_chain.frames == 0) {
+        g_chain.rate     = sfinfo.samplerate;
+        g_chain.channels = sfinfo.channels;
+    } else if (g_chain.rate != (unsigned)sfinfo.samplerate ||
+               g_chain.channels != (unsigned)sfinfo.channels) {
+        fprintf(stderr,
+                "audio_chain_add: format mismatch (queue %u Hz %u‑ch, "
+                "segment %u Hz %u‑ch)\n",
+                g_chain.rate, g_chain.channels,
+                (unsigned)sfinfo.samplerate, (unsigned)sfinfo.channels);
+        sf_close(sf);
+        return false;
+    }
+
+    /* -------------------------------------------------------------
+     *  Make sure the internal buffer is big enough and read the data.
+     * ------------------------------------------------------------- */
+    size_t new_total = g_chain.frames + (size_t)sfinfo.frames;
+    if (!chain_ensure_capacity(new_total))
+    {
+        sf_close(sf);
+        return false;
+    }
+
+    /* Read directly into the tail of the buffer */
+    sf_count_t got = sf_readf_short(sf,
+                                    g_chain.buf +
+                                    g_chain.frames * g_chain.channels,
+                                    sfinfo.frames);
+    if (got != sfinfo.frames) {
+        fprintf(stderr,
+                "short read: wanted %lld, got %lld\n",
+                (long long)sfinfo.frames,
+                (long long)got);
+        sf_close(sf);
+        return false;
+    }
+
+    g_chain.frames = new_total;
+    sf_close(sf);
+    return true;
+}
+
+/* Convenience wrapper for an embedded asset. */
+bool audio_chain_add_by_name(const char *name)
+{
+    const EmbeddedWav e = get_embedded_wav(name);
+    if (!e.data) {
+        fprintf(stderr, "Embedded wav not found: %s\n", name);
+        return false;
+    }
+
+    fprintf(stdout, "Added: %s\n", name);
+    return audio_chain_add(e.data, e.size);
+}
+
+/* Reset the queue – keep the allocated buffer so that a later add does
+   not need to realloc. */
+void audio_chain_reset(void)
+{
+    g_chain.frames = 0;
+    /* rate & channels stay as‑is; they will be re‑checked on the next
+       add. */
+}
+
+/* -------------------------------------------------------------
+ *  Drain the queue – play everything that has been added.
+ * ------------------------------------------------------------- */
+bool audio_chain_play(void)
+{
+    if (!pcm_handle) {
+        if (!audio_init())
+            return false;
+    }
+
+    if (g_chain.frames == 0) {
+        /* nothing to do – but the call is not an error */
+        return true;
+    }
+
+    /* -------------------------------------------------------------
+     *  (re)configure hardware parameters – only when they differ from
+     *  the current ALSA configuration.
+     * ------------------------------------------------------------- */
     static unsigned int cur_rate = 0, cur_chan = 0;
     static snd_pcm_uframes_t period_frames = 0;
     static snd_pcm_uframes_t buffer_frames = 0;
 
-    if (!cur_rate || cur_rate != sfinfo.samplerate ||
-        cur_chan != sfinfo.channels) {
+    if (!cur_rate ||
+        cur_rate != g_chain.rate ||
+        cur_chan != g_chain.channels) {
+
         if (!set_hw_params(pcm_handle,
-                           sfinfo.samplerate,
-                           sfinfo.channels,
+                           g_chain.rate,
+                           g_chain.channels,
                            SND_PCM_FORMAT_S16_LE,
                            &period_frames,
                            &buffer_frames)) {
-            sf_close(sf);
             return false;
-        } /*  */
-        cur_rate   = sfinfo.samplerate;
-        cur_chan   = sfinfo.channels;
+        }
+        cur_rate = g_chain.rate;
+        cur_chan = g_chain.channels;
+    } else {
+        /* The device may be left in the DRAINING/SETUP state after a
+           previous play – bring it back to PREPARED. */
+        snd_pcm_prepare(pcm_handle);
     }
 
-    /* ---------- allocate a buffer that matches the period ---------- */
-    size_t samples_per_period = period_frames * sfinfo.channels;
-    short *buf = malloc(samples_per_period * sizeof(short));
-    if (!buf) { perror("malloc"); sf_close(sf); return false; }
+    /* -------------------------------------------------------------
+     *  Playback loop – walk the already‑filled buffer in period‑size
+     *  chunks.
+     * ------------------------------------------------------------- */
+    size_t frames_left = g_chain.frames;
+    const short *src = g_chain.buf;
 
-    /* ---------- main playback loop ---------- */
-    sf_count_t frames_read;
-    while ((frames_read = sf_readf_short(sf, buf, period_frames)) > 0) {
+    while (frames_left > 0) {
+        snd_pcm_uframes_t chunk = period_frames;
+        if (chunk > frames_left)
+            chunk = frames_left;
+
         size_t written = 0;
-        while (written < (size_t)frames_read) {
+        while (written < chunk) {
             int rc = snd_pcm_wait(pcm_handle, 1000);
             if (rc < 0) {
                 fprintf(stderr, "poll error: %s\n", strerror(-rc));
-                break;
+                return false;
             }
+
             rc = snd_pcm_writei(pcm_handle,
-                                buf + written * sfinfo.channels,
-                                frames_read - written);
-            if (rc == -EPIPE) {
+                               src + written * g_chain.channels,
+                               chunk - written);
+            if (rc == -EPIPE) {               /* underrun */
                 snd_pcm_prepare(pcm_handle);
                 continue;
             }
@@ -216,20 +383,21 @@ bool audio_play_wav_mem(const unsigned char *wav_buf,
                 if (snd_pcm_recover(pcm_handle, rc, 0) < 0) {
                     fprintf(stderr, "ALSA write error: %s\n",
                             snd_strerror(rc));
-                    free(buf);
-                    sf_close(sf);
                     return false;
                 }
                 continue;
             }
             written += rc;
         }
+
+        src          += chunk * g_chain.channels;
+        frames_left  -= chunk;
     }
 
-    /* ---------- finish cleanly ---------- */
-    snd_pcm_drain(pcm_handle);
-    free(buf);
-    sf_close(sf);
+    /* -------------------------------------------------------------
+     *  Finish cleanly.
+     * ------------------------------------------------------------- */
+    snd_pcm_drain(pcm_handle);   /* let the last frames finish playing */
     return true;
 }
 
@@ -273,13 +441,13 @@ bool play_embedded_wav_by_name(const char *name)
         return false;
     }
 
-    /* ---------- sanity check (same as in your original code) ---------- */
+    /* ---------- sanity check ---------- */
     if ((sfinfo.format & SF_FORMAT_TYPEMASK) != SF_FORMAT_WAV ||
         (sfinfo.format & SF_FORMAT_SUBMASK) != SF_FORMAT_PCM_16) {
         fprintf(stderr,
                 "Unsupported WAV (need 16‑bit PCM, got 0x%08x)\n",
                 sfinfo.format);
-        sf_close(sf);
+        sf_close(sf);          /* frees mf */
         return false;
     }
 
@@ -294,13 +462,15 @@ bool play_embedded_wav_by_name(const char *name)
         }
     }
 
-    /* ---------- re‑configure HW only when needed ---------- */
+    /* ---------- (re)configure HW parameters only when they change ---------- */
     static unsigned int cur_rate = 0, cur_chan = 0;
     static snd_pcm_uframes_t period_frames = 0;
     static snd_pcm_uframes_t buffer_frames = 0;
 
-    if (!cur_rate || cur_rate != sfinfo.samplerate ||
+    if (!cur_rate ||
+        cur_rate != sfinfo.samplerate ||
         cur_chan != sfinfo.channels) {
+
         if (!set_hw_params(pcm_handle,
                            sfinfo.samplerate,
                            sfinfo.channels,
@@ -312,14 +482,23 @@ bool play_embedded_wav_by_name(const char *name)
         }
         cur_rate = sfinfo.samplerate;
         cur_chan = sfinfo.channels;
+    } else {
+        /* The device is still in the *prepared* state from the previous
+         * playback, but after a call to snd_pcm_drain() it is no longer
+         * ready.  Bring it back to the prepared state. */
+        snd_pcm_prepare(pcm_handle);
     }
 
     /* ---------- allocate a buffer that matches one period ---------- */
     size_t samples_per_period = period_frames * sfinfo.channels;
-    short *buf = malloc(samples_per_period * sizeof(short));
-    if (!buf) { perror("malloc"); sf_close(sf); return false; }
+    short *buf = malloc(samples_per_period * sizeof *buf);
+    if (!buf) {
+        perror("malloc");
+        sf_close(sf);
+        return false;
+    }
 
-    /* ---------- playback loop (identical to your original) ---------- */
+    /* ---------- playback loop ---------- */
     sf_count_t frames_read;
     while ((frames_read = sf_readf_short(sf, buf, period_frames)) > 0) {
         size_t written = 0;
@@ -329,10 +508,11 @@ bool play_embedded_wav_by_name(const char *name)
                 fprintf(stderr, "poll error: %s\n", strerror(-rc));
                 break;
             }
+
             rc = snd_pcm_writei(pcm_handle,
-                                buf + written * sfinfo.channels,
-                                frames_read - written);
-            if (rc == -EPIPE) {                /* underrun */
+                               buf + written * sfinfo.channels,
+                               frames_read - written);
+            if (rc == -EPIPE) {               /* underrun */
                 snd_pcm_prepare(pcm_handle);
                 continue;
             }
@@ -350,9 +530,12 @@ bool play_embedded_wav_by_name(const char *name)
         }
     }
 
-    /* ---------- clean up ---------- */
-    snd_pcm_drain(pcm_handle);
+    /* ---------- finish cleanly ---------- */
+    snd_pcm_drain(pcm_handle);   /* let the last frames finish playing */
+    /* The device is now in the DRAINING/SETUP state → prepare it for the
+     * next call (or let the code above do it on the next invocation). */
+
     free(buf);
-    sf_close(sf);                /* this also frees the MemFile we allocated */
+    sf_close(sf);                /* frees the MemFile we allocated */
     return true;
 }
