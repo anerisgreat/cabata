@@ -74,6 +74,34 @@ static void cleanup_socket(void)
     unlink(SOCK_PATH);
 }
 
+
+/* ----------------------------------------------------------------------
+   Helper: on unusual exit, cleanup socket
+   ---------------------------------------------------------------------- */
+static void sig_cleanup(int sig)
+{
+    (void)sig;               /* unused */
+    unlink(SOCK_PATH);       /* remove the socket file */
+    _exit(EXIT_FAILURE);    /* async‑safe exit */
+}
+/* Register the handler for the signals we care about */
+static void setup_signal_handlers(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));   /* zero‑fill the whole struct */
+    sa.sa_handler = sig_cleanup;  /* our handler */
+    sigemptyset(&sa.sa_mask);     /* no additional signals blocked */
+    sa.sa_flags = SA_RESTART;     /* restart interrupted syscalls */
+
+    /* Install the handler */
+    if (sigaction(SIGINT,  &sa, NULL) == -1 ||
+        sigaction(SIGTERM, &sa, NULL) == -1 ||
+        sigaction(SIGHUP,  &sa, NULL) == -1) {
+        perror("sigaction");
+        exit(EXIT_FAILURE);
+    }
+}
 /* ----------------------------------------------------------------------
    Daemon core: timer loop + command handling
    ---------------------------------------------------------------------- */
@@ -371,30 +399,22 @@ static void client_send(const char *cmd, const char *my_path)
     strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        if (errno == ENOENT) {
-            /* ----- Daemon not running – start it ----- */
+        if (errno == ENOENT || errno == ECONNREFUSED) {
+            /* stale socket – delete it and try to spawn the daemon */
+            unlink(SOCK_PATH);
             pid_t pid = fork();
-            if (pid == -1) {
-                perror("fork");
-                exit(EXIT_FAILURE);
-            }
-            if (pid == 0) {                 /* child */
-                /* Use the same executable that the client was started with */
+            if (pid == 0) {
                 execlp(my_path, my_path, "--daemon", (char *)NULL);
-                /* If execlp returns we failed */
-                perror("execlp");
                 _exit(EXIT_FAILURE);
             }
-            /* parent: give the daemon a moment to bind the socket */
             close(fd);
-            sleep(1);
-            client_send(cmd, my_path);      /* retry once the daemon is up */
+            sleep(1);                 /* give daemon time to bind */
+            client_send(cmd, my_path);/* retry */
             return;
-        } else {
-            perror("connect");
-            close(fd);
-            exit(EXIT_FAILURE);
         }
+        perror("connect");
+        close(fd);
+        exit(EXIT_FAILURE);
     }
 
     /* ----- send the command ----- */
@@ -417,10 +437,11 @@ int main(int argc, char *argv[])
 {
     if (argc > 1 && strcmp(argv[1], "--daemon") == 0) {
         /* ---------- Daemon mode ---------- */
-        if (daemon(0, 1) == -1) {
+        if (daemon(0, 0) == -1) {
             perror("daemon");
             exit(EXIT_FAILURE);
         }
+        setup_signal_handlers();
         daemon_loop();          /* never returns */
         return 0;
     }

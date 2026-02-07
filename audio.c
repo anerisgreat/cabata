@@ -296,7 +296,6 @@ bool audio_chain_add_by_name(const char *name)
         return false;
     }
 
-    fprintf(stdout, "Added: %s\n", name);
     return audio_chain_add(e.data, e.size);
 }
 
