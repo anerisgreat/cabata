@@ -127,54 +127,79 @@ static int make_timerfd(void)
 static void maybe_add_message(void)
 {
     char buf[16];
-    if ((rand() % 20) == 0) {
-        //Randomly generate message001 through message100
+    if(rand() % 20 == 0){
         int msg_num = (rand() % 100) + 1;
         snprintf(buf, sizeof(buf), "message%03d", msg_num);
         audio_chain_add_by_name(buf);
     }
 }
 
+static void announce_done(void)
+{
+    audio_chain_add_by_name("done");
+    audio_chain_play();
+    audio_chain_reset();
+}
+
 /* Randomly maybe play a message */
-static void announce_start_of_round(
-                                    int cur_round,
-                                    int total_rounds,
-                                    int minutes,
-                                    bool is_work)
+static void announce_start_of_round()
 {
     char buf[16];
     audio_chain_add_by_name("round");
     //Randomly generate message001 through message100
-    snprintf(buf, sizeof(buf), "num%d", cur_round);
+    snprintf(buf, sizeof(buf), "num%d", timer.cur_round + 1);
     audio_chain_add_by_name(buf);
     audio_chain_add_by_name("of");
-    snprintf(buf, sizeof(buf), "num%d", total_rounds);
+    snprintf(buf, sizeof(buf), "num%d", timer.rounds);
     audio_chain_add_by_name(buf);
 
 
-    if(is_work){
+    if(timer.in_work){
         audio_chain_add_by_name("workfor");
     } else {
         audio_chain_add_by_name("restfor");
     }
     //Convert n_min_remaining to const char*
-    snprintf(buf, sizeof(buf), "num%d", minutes);
+    snprintf(buf, sizeof(buf), "num%d", timer.sec_remaining / 60);
     audio_chain_add_by_name(buf);
     audio_chain_add_by_name("minutes");
-    sleep(1);
     maybe_add_message();
     audio_chain_play();
     audio_chain_reset();
 
 }
 
+static void announce_time_left()
+{
+    char buf[16];
+    int n = timer.sec_remaining / 60;
+    audio_chain_add_by_name("youhave");
+    //Convert n_min_remaining to const char*
+    snprintf(buf, sizeof(buf), "num%d", n);
+    audio_chain_add_by_name(buf);
+    audio_chain_add_by_name("minutesleft");
+
+    if(timer.in_work){
+        audio_chain_add_by_name("towork");
+    }
+    else {
+        audio_chain_add_by_name("torest");
+    }
+
+    maybe_add_message();
+    audio_chain_play();
+    audio_chain_reset();
+}
+
+static void announce_paused(){
+    audio_chain_add_by_name("paused");
+    audio_chain_play();
+    audio_chain_reset();
+}
+
 /* Called every second – advances the timer, plays sounds, etc. */
 static void tick(void)
 {
-    //We use this for str formatting
-    char buf[16];
-    int n;
-
     if (timer.state != RUNNING)
         return;
 
@@ -182,57 +207,29 @@ static void tick(void)
     if (timer.sec_remaining <= 0) {
         if (timer.in_work) {
             /* work finished → start rest */
-            announce_start_of_round(
-                                    timer.cur_round + 1,
-                                    timer.rounds,
-                                    timer.rest_sec / 60,
-                                    false);
             timer.in_work = false;
+            announce_start_of_round();
             timer.sec_remaining = timer.rest_sec;
         } else {
             /* rest finished → next round or stop */
             timer.cur_round++;
             if (timer.cur_round >= timer.rounds) {
                 /* all rounds finished */
-                audio_chain_add_by_name("done");
-                audio_chain_play();
-                audio_chain_reset();
                 timer.state = IDLE;
                 fprintf(stderr, "Tabata complete.\n");
+                announce_done();
                 return;
             }
 
             timer.in_work = true;
             timer.sec_remaining = timer.work_sec;
 
-            announce_start_of_round(
-                                    timer.cur_round + 1,
-                                    timer.rounds,
-                                    timer.work_sec / 60,
-                                    true);
+            announce_start_of_round();
         }
     } else {
         //Check if timer.sec_remaining is divisible by 5 minutes:
         if (timer.sec_remaining % 300 == 0) {
-            n = timer.sec_remaining / 60;
-            audio_chain_add_by_name("youhave");
-            //Convert n_min_remaining to const char*
-            snprintf(buf, sizeof(buf), "num%d", n);
-            audio_chain_add_by_name(buf);
-            audio_chain_add_by_name("minutesleft");
-
-            if(timer.in_work){
-                audio_chain_add_by_name("towork");
-            }
-            else {
-                audio_chain_add_by_name("torest");
-            }
-
-            sleep(1);
-
-            maybe_add_message();
-            audio_chain_play();
-            audio_chain_reset();
+            announce_time_left();
         }
     }
 }
@@ -262,11 +259,7 @@ static void handle_command(const char *cmd, int client_fd)
             //These variables are only used here
             snprintf(reply, sizeof(reply), "OK Started\n");
 
-            announce_start_of_round(
-                                    1,
-                                    timer.rounds,
-                                    timer.work_sec / 60,
-                                    true);
+            announce_start_of_round();
         }
     } else if (strcmp(cmd, "stop") == 0) {
         if (timer.state == IDLE) {
@@ -274,20 +267,26 @@ static void handle_command(const char *cmd, int client_fd)
         } else {
             timer.state = IDLE;
             snprintf(reply, sizeof(reply), "OK Stopped\n");
+            announce_paused();
         }
     } else if (strcmp(cmd, "status") == 0) {
         if (timer.state == IDLE) {
             snprintf(reply, sizeof(reply), "IDLE\n");
+            announce_paused();
         } else {
             const char *phase = timer.in_work ? "WORK" : "REST";
             snprintf(reply, sizeof(reply),
                      "RUNNING round %d/%d %s %d sec left\n",
                      timer.cur_round + 1, timer.rounds, phase,
                      timer.sec_remaining);
+
+            announce_time_left();
         }
     } else if (strcmp(cmd, "quit") == 0) {
         snprintf(reply, sizeof(reply), "OK Bye\n");
         write(client_fd, reply, strlen(reply));
+
+        announce_done();
         /* Tell main loop to exit */
         exit(EXIT_SUCCESS);
     } else {
@@ -335,6 +334,9 @@ static void daemon_loop(void)
     timer_fd = make_timerfd();
 
     fd_set readset;
+
+    //Randomize seed for random messages
+    srand(time(NULL));
     for (;;) {
         FD_ZERO(&readset);
         FD_SET(listen_fd, &readset);
