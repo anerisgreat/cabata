@@ -259,14 +259,14 @@ static void handle_command(const char *cmd, int client_fd)
             timer.sec_remaining = w;
             timer.state = RUNNING;
 
+            //These variables are only used here
+            snprintf(reply, sizeof(reply), "OK Started\n");
+
             announce_start_of_round(
                                     1,
                                     timer.rounds,
                                     timer.work_sec / 60,
                                     true);
-
-            //These variables are only used here
-            snprintf(reply, sizeof(reply), "OK Started\n");
         }
     } else if (strcmp(cmd, "stop") == 0) {
         if (timer.state == IDLE) {
