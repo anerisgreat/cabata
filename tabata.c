@@ -208,8 +208,8 @@ static void tick(void)
         if (timer.in_work) {
             /* work finished → start rest */
             timer.in_work = false;
-            announce_start_of_round();
             timer.sec_remaining = timer.rest_sec;
+            announce_start_of_round();
         } else {
             /* rest finished → next round or stop */
             timer.cur_round++;
